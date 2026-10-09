@@ -599,10 +599,10 @@ export class ScheduleService {
       let updated = { ...current };
       let dirty = false;
 
-      const runningIndex = updated.runs.findIndex((run) => run.status === "running");
-      if (runningIndex !== -1) {
-        const runs = [...updated.runs];
-        const runningRun = runs[runningIndex];
+      const runs = updated.runs.map((runningRun): ScheduleRun => {
+        if (runningRun.status !== "running") {
+          return runningRun;
+        }
         if (
           updated.target.type === "new-agent" &&
           runningRun.workspaceId &&
@@ -617,14 +617,16 @@ export class ScheduleService {
             runId: runningRun.id,
           });
         }
-        runs[runningIndex] = {
+        dirty = true;
+        return {
           ...runningRun,
           status: "failed",
           endedAt: now.toISOString(),
           error: "Daemon restarted before the scheduled run completed",
         };
+      });
+      if (dirty) {
         updated = { ...updated, runs };
-        dirty = true;
       }
 
       if (
@@ -645,23 +647,21 @@ export class ScheduleService {
       }
       return current;
     });
-    const interruptedWorkspace = interruptedWorkspaces[0];
-    if (!interruptedWorkspace) {
-      return;
-    }
-    try {
-      await this.archiveWorkspace(interruptedWorkspace.workspaceId);
-    } catch (error) {
-      this.logger.warn(
-        {
-          err: error,
-          agentId: interruptedWorkspace.agentId,
-          workspaceId: interruptedWorkspace.workspaceId,
-          scheduleId,
-          runId: interruptedWorkspace.runId,
-        },
-        "Failed to archive interrupted scheduled workspace after daemon restart",
-      );
+    for (const interruptedWorkspace of interruptedWorkspaces) {
+      try {
+        await this.archiveWorkspace(interruptedWorkspace.workspaceId);
+      } catch (error) {
+        this.logger.warn(
+          {
+            err: error,
+            agentId: interruptedWorkspace.agentId,
+            workspaceId: interruptedWorkspace.workspaceId,
+            scheduleId,
+            runId: interruptedWorkspace.runId,
+          },
+          "Failed to archive interrupted scheduled workspace after daemon restart",
+        );
+      }
     }
   }
 
@@ -693,6 +693,12 @@ export class ScheduleService {
     options?: { manual?: boolean },
   ): Promise<void> {
     const manual = options?.manual === true;
+    if (this.runningScheduleIds.has(schedule.id)) {
+      if (manual) {
+        throw new Error(`Schedule ${schedule.id} is already running`);
+      }
+      return;
+    }
     this.runningScheduleIds.add(schedule.id);
     const runId = randomUUID();
     const runningRun: ScheduleRun = {
@@ -705,46 +711,73 @@ export class ScheduleService {
       output: null,
       error: null,
     };
-    const scheduleWithRun = await this.appendRunningRun(schedule.id, runningRun);
-
     try {
-      const result = await this.runner(scheduleWithRun, runId);
-      await this.finishRun({
+      const scheduleWithRun = await this.appendRunningRun({
         scheduleId: schedule.id,
-        runId,
-        status: "succeeded",
-        agentId: result.agentId,
-        output: result.output,
-        error: null,
-        targetGone: false,
+        runningRun,
         manual,
       });
-    } catch (error) {
-      await this.finishRun({
-        scheduleId: schedule.id,
-        runId,
-        status: "failed",
-        agentId: null,
-        output: null,
-        error: error instanceof Error ? error.message : String(error),
-        targetGone: error instanceof ScheduleTargetGoneError,
-        manual,
-      });
+      if (!scheduleWithRun) {
+        return;
+      }
+      try {
+        const result = await this.runner(scheduleWithRun, runId);
+        await this.finishRun({
+          scheduleId: schedule.id,
+          runId,
+          status: "succeeded",
+          agentId: result.agentId,
+          output: result.output,
+          error: null,
+          targetGone: false,
+          manual,
+        });
+      } catch (error) {
+        await this.finishRun({
+          scheduleId: schedule.id,
+          runId,
+          status: "failed",
+          agentId: null,
+          output: null,
+          error: error instanceof Error ? error.message : String(error),
+          targetGone: error instanceof ScheduleTargetGoneError,
+          manual,
+        });
+      }
     } finally {
       this.runningScheduleIds.delete(schedule.id);
     }
   }
 
-  private async appendRunningRun(
-    scheduleId: string,
-    runningRun: ScheduleRun,
-  ): Promise<StoredSchedule> {
-    const updated = await this.store.update(scheduleId, (schedule) => ({
-      ...schedule,
-      updatedAt: runningRun.startedAt,
-      runs: [...schedule.runs, runningRun],
-    }));
-    return requireSchedule(updated, scheduleId);
+  private async appendRunningRun(params: {
+    scheduleId: string;
+    runningRun: ScheduleRun;
+    manual: boolean;
+  }): Promise<StoredSchedule | null> {
+    const { scheduleId, runningRun, manual } = params;
+    let claimed = false;
+    const updated = await this.store.update(scheduleId, (schedule) => {
+      // A tick can wait on an earlier schedule while another tick consumes this slot.
+      // Check and append under the store's per-schedule mutation lock.
+      if (
+        schedule.status === "completed" ||
+        schedule.runs.some((run) => run.status === "running") ||
+        (!manual &&
+          (schedule.status !== "active" || schedule.nextRunAt !== runningRun.scheduledFor))
+      ) {
+        return schedule;
+      }
+      if (!manual && shouldCompleteSchedule(schedule, this.now())) {
+        return completeSchedule(schedule, this.now());
+      }
+      claimed = true;
+      return {
+        ...schedule,
+        updatedAt: runningRun.startedAt,
+        runs: [...schedule.runs, runningRun],
+      };
+    });
+    return claimed ? requireSchedule(updated, scheduleId) : null;
   }
 
   private async finishRun(params: {
@@ -758,6 +791,10 @@ export class ScheduleService {
     manual: boolean;
   }): Promise<void> {
     const updatedSchedule = await this.store.update(params.scheduleId, (schedule) => {
+      const finishingRun = schedule.runs.find((run) => run.id === params.runId);
+      if (!finishingRun || finishingRun.status !== "running") {
+        return schedule;
+      }
       const now = this.now();
       const completedRuns = schedule.runs.map((run) =>
         run.id === params.runId
@@ -794,8 +831,9 @@ export class ScheduleService {
           ...updated,
           nextRunAt: null,
         };
-      } else {
-        const after = new Date(schedule.nextRunAt ?? now.toISOString());
+      } else if (schedule.nextRunAt === finishingRun.scheduledFor) {
+        // Finishing an old or duplicate run must not advance a newer cadence cursor.
+        const after = new Date(finishingRun.scheduledFor);
         let nextRunAt = computeNextRunAt(updated.cadence, after);
         while (nextRunAt.getTime() <= now.getTime()) {
           nextRunAt = computeNextRunAt(updated.cadence, nextRunAt);

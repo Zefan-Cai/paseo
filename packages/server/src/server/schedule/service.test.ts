@@ -40,10 +40,32 @@ import {
   type ScheduleServiceOptions,
 } from "./service.js";
 import { ScheduleStore } from "./store.js";
-import type { ScheduleExecutionResult, StoredSchedule } from "@getpaseo/protocol/schedule/types";
+import type {
+  ScheduleExecutionResult,
+  ScheduleRun,
+  StoredSchedule,
+} from "@getpaseo/protocol/schedule/types";
 
 interface ScheduleServiceInternals {
   executeSchedule(schedule: StoredSchedule, runId: string): Promise<ScheduleExecutionResult>;
+  finishRun(params: {
+    scheduleId: string;
+    runId: string;
+    status: "succeeded" | "failed";
+    agentId: string | null;
+    output: string | null;
+    error: string | null;
+    targetGone: boolean;
+    manual: boolean;
+  }): Promise<void>;
+}
+
+function deferred() {
+  let resolve: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve: () => resolve() };
 }
 
 const SCHEDULE_TEST_CAPABILITIES: AgentCapabilityFlags = {
@@ -387,6 +409,176 @@ describe("ScheduleService", () => {
     const resumed = await service.resume(created.id);
     expect(resumed.status).toBe("active");
     expect(resumed.nextRunAt).toBe("2026-01-01T00:04:00.000Z");
+  });
+
+  test.each([false, true])(
+    "overlapping ticks do not replay a slot after another tick finishes it (failed=%s)",
+    async (failed) => {
+      const firstStarted = deferred();
+      const releaseFirst = deferred();
+      const calls: string[] = [];
+      const service = createScheduleService({
+        paseoHome: tempDir,
+        logger: createTestLogger(),
+        agentManager: new AgentManager({ logger: createTestLogger() }),
+        agentStorage,
+        providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+        now: () => now,
+        runner: async (schedule) => {
+          calls.push(schedule.prompt);
+          if (schedule.prompt === "first") {
+            firstStarted.resolve();
+            await releaseFirst.promise;
+          }
+          if (schedule.prompt === "second" && failed) {
+            throw new Error("target agent already has an active run");
+          }
+          return { agentId: null, output: "done" };
+        },
+      });
+      const first = await service.create({
+        prompt: "first",
+        cadence: { type: "cron", expression: "*/15 * * * *", timezone: "UTC" },
+        target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+      });
+      now = new Date("2026-01-01T00:00:01.000Z");
+      const second = await service.create({
+        prompt: "second",
+        cadence: { type: "cron", expression: "*/15 * * * *", timezone: "UTC" },
+        target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+      });
+      now = new Date("2026-01-01T00:15:00.000Z");
+      const firstTick = service.tick();
+      await firstStarted.promise;
+      await service.tick();
+      releaseFirst.resolve();
+      await firstTick;
+
+      expect(calls).toEqual(["first", "second"]);
+      expect((await service.inspect(first.id)).runs).toHaveLength(1);
+      const inspected = await service.inspect(second.id);
+      expect(inspected.runs).toHaveLength(1);
+      expect(inspected.runs[0].status).toBe(failed ? "failed" : "succeeded");
+      expect(inspected.nextRunAt).toBe("2026-01-01T00:30:00.000Z");
+    },
+  );
+
+  test("duplicate slot finishes consume the cadence once and repeated finishes are inert", async () => {
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => ({ agentId: null, output: "done" }),
+    });
+    const created = await service.create({
+      prompt: "legacy duplicate slot",
+      cadence: { type: "cron", expression: "*/15 * * * *", timezone: "UTC" },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    const store = new ScheduleStore(join(tempDir, "schedules"), createTestLogger());
+    const runs: ScheduleRun[] = ["original", "duplicate"].map((id) => ({
+      id,
+      scheduledFor: "2026-01-01T00:15:00.000Z",
+      startedAt: "2026-01-01T00:15:01.000Z",
+      endedAt: null,
+      status: "running",
+      agentId: null,
+      output: null,
+      error: null,
+    }));
+    await store.update(created.id, (schedule) => ({ ...schedule, runs }));
+    const internals = service as unknown as ScheduleServiceInternals;
+    const completion = {
+      scheduleId: created.id,
+      status: "failed" as const,
+      agentId: null,
+      output: null,
+      error: "target agent already has an active run",
+      targetGone: false,
+      manual: false,
+    };
+    now = new Date("2026-01-01T00:16:00.000Z");
+    await Promise.all([
+      internals.finishRun({ ...completion, runId: "original" }),
+      internals.finishRun({ ...completion, runId: "duplicate" }),
+    ]);
+    const finished = await service.inspect(created.id);
+    expect(finished.runs.map((run) => run.status)).toEqual(["failed", "failed"]);
+    expect(finished.nextRunAt).toBe("2026-01-01T00:30:00.000Z");
+
+    now = new Date("2026-01-01T00:46:00.000Z");
+    await internals.finishRun({ ...completion, runId: "original" });
+    await internals.finishRun({ ...completion, runId: "missing" });
+    expect(await service.inspect(created.id)).toEqual(finished);
+  });
+
+  test("a late run finish preserves a concurrently updated cadence cursor", async () => {
+    const started = deferred();
+    const release = deferred();
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => {
+        started.resolve();
+        await release.promise;
+        return { agentId: null, output: "done" };
+      },
+    });
+    const created = await service.create({
+      prompt: "cadence changed while running",
+      cadence: { type: "cron", expression: "*/15 * * * *", timezone: "UTC" },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    now = new Date("2026-01-01T00:15:00.000Z");
+    const tick = service.tick();
+    await started.promise;
+    now = new Date("2026-01-01T00:20:00.000Z");
+    const updated = await service.update({
+      id: created.id,
+      cadence: { type: "cron", expression: "*/30 * * * *", timezone: "UTC" },
+    });
+    expect(updated.nextRunAt).toBe("2026-01-01T00:30:00.000Z");
+    release.resolve();
+    await tick;
+    const finished = await service.inspect(created.id);
+    expect(finished.nextRunAt).toBe(updated.nextRunAt);
+    expect(finished.runs[0].status).toBe("succeeded");
+  });
+
+  test("manual runs preserve the scheduled slot and also work while paused", async () => {
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => ({ agentId: null, output: "done" }),
+    });
+    const created = await service.create({
+      prompt: "manual does not move the cursor",
+      cadence: { type: "cron", expression: "*/15 * * * *", timezone: "UTC" },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+    });
+    now = new Date("2026-01-01T00:15:00.000Z");
+    const manual = await service.runOnce(created.id);
+    expect(manual.nextRunAt).toBe(created.nextRunAt);
+    await service.tick();
+    const scheduled = await service.inspect(created.id);
+    expect(scheduled.runs).toHaveLength(2);
+    expect(scheduled.nextRunAt).toBe("2026-01-01T00:30:00.000Z");
+    await service.pause(created.id);
+    const paused = await service.runOnce(created.id);
+    expect(paused.status).toBe("paused");
+    expect(paused.nextRunAt).toBeNull();
+    expect(paused.runs).toHaveLength(3);
   });
 
   test("completes schedules when max runs is reached", async () => {
@@ -1945,6 +2137,53 @@ describe("ScheduleService", () => {
 
     expect((await service2.list()).map((schedule) => schedule.id)).toEqual([created.id]);
     await service2.stop();
+  });
+
+  test("startup recovery clears every legacy duplicate running slot before the next tick", async () => {
+    const archiveCalls: string[] = [];
+    const service = createScheduleService({
+      paseoHome: tempDir,
+      logger: createTestLogger(),
+      agentManager: new AgentManager({ logger: createTestLogger() }),
+      agentStorage,
+      providerSnapshotManager: NO_UNATTENDED_SCHEDULE_POLICY,
+      now: () => now,
+      runner: async () => ({ agentId: null, output: "ok" }),
+      archiveWorkspace: async (workspaceId) => {
+        archiveCalls.push(workspaceId);
+      },
+    });
+    const created = await service.create({
+      prompt: "legacy duplicate running records",
+      cadence: { type: "every", everyMs: 60_000 },
+      target: { type: "new-agent", config: { provider: "claude", cwd: tempDir } },
+      runOnCreate: false,
+    });
+    const runs: ScheduleRun[] = ["first", "second"].map((id) => ({
+      id,
+      scheduledFor: "2026-01-01T00:01:00.000Z",
+      startedAt: "2026-01-01T00:01:00.000Z",
+      endedAt: null,
+      status: "running",
+      agentId: null,
+      workspaceId: `wks_${id}`,
+      output: null,
+      error: null,
+    }));
+    const store = new ScheduleStore(join(tempDir, "schedules"), createTestLogger());
+    await store.update(created.id, (schedule) => ({ ...schedule, runs }));
+    now = new Date("2026-01-01T00:10:00.000Z");
+    await service.start();
+    await service.stop();
+    expect(archiveCalls).toEqual(["wks_first", "wks_second"]);
+    const recovered = await service.inspect(created.id);
+    expect(recovered.runs.map((run) => run.status)).toEqual(["failed", "failed"]);
+    expect(recovered.nextRunAt).toBe("2026-01-01T00:11:00.000Z");
+    now = new Date("2026-01-01T00:11:00.000Z");
+    await service.tick();
+    const next = await service.inspect(created.id);
+    expect(next.runs.map((run) => run.status)).toEqual(["failed", "failed", "succeeded"]);
+    expect(next.nextRunAt).toBe("2026-01-01T00:12:00.000Z");
   });
 
   test("startup recovery archives an interrupted run workspace with an associated agent", async () => {
